@@ -90,7 +90,7 @@ def main():
                 "name": "Check Android release signing credentials",
                 "env": {k: "${{ secrets." + k + " }}" for k in [
                     "ANDROID_SIGNING_KEY", "ANDROID_ALIAS", "ANDROID_KEY_STORE_PASSWORD", "ANDROID_KEY_PASSWORD"]},
-                "run": "python3 - <<'PY'\nimport os, sys\nrequired = ['ANDROID_SIGNING_KEY', 'ANDROID_ALIAS', 'ANDROID_KEY_STORE_PASSWORD', 'ANDROID_KEY_PASSWORD']\nmissing = [k for k in required if not os.environ.get(k)]\nif missing:\n    sys.exit('Missing Android signing secrets: ' + ', '.join(missing))\nprint('Android signing configuration present; values hidden.')\nPY\n",
+                "run": "python3 - <<'PY'\nimport os\nrequired = ['ANDROID_SIGNING_KEY', 'ANDROID_ALIAS', 'ANDROID_KEY_STORE_PASSWORD', 'ANDROID_KEY_PASSWORD']\nmissing = [k for k in required if not os.environ.get(k)]\nif missing:\n    print('Android signing secrets are incomplete; unsigned test APKs will be generated. Missing: ' + ', '.join(missing))\nelse:\n    print('Android signing configuration present; values hidden.')\nPY\n",
             },
         ],
     }
@@ -110,6 +110,8 @@ def main():
             condition = step.get("if", "")
             if isinstance(condition, str) and condition:
                 step["if"] = condition.replace("inputs.upload-artifact", "true")
+                step["if"] = step["if"].replace("env.ANDROID_SIGNING_KEY != null", "env.ANDROID_SIGNING_KEY != ''")
+                step["if"] = step["if"].replace("env.ANDROID_SIGNING_KEY == null", "env.ANDROID_SIGNING_KEY == ''")
                 if step["if"] in ("true", "${{ true }}"):
                     step.pop("if")
             if name == "build-rustdesk-android-universal" and step.get("name") == "Upload Artifacts":
