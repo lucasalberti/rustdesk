@@ -51,12 +51,13 @@ jobs:
         ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
       run: |
         python3 - <<'PY'
-        import os, sys
+        import os
         required = ['ANDROID_SIGNING_KEY', 'ANDROID_ALIAS', 'ANDROID_KEY_STORE_PASSWORD', 'ANDROID_KEY_PASSWORD']
         missing = [k for k in required if not os.environ.get(k)]
         if missing:
-            sys.exit('Missing Android signing secrets: ' + ', '.join(missing))
-        print('Android signing configuration present; values hidden.')
+            print('Android signing secrets are incomplete; unsigned test APKs will be generated. Missing: ' + ', '.join(missing))
+        else:
+            print('Android signing configuration present; values hidden.')
         PY
   generate-bridge:
     uses: ./.github/workflows/visual-software-bridge.yml
@@ -761,7 +762,7 @@ jobs:
         echo Last build tool version is: $BUILD_TOOL_VERSION
     - uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407
       name: Sign app APK
-      if: env.ANDROID_SIGNING_KEY != null
+      if: env.ANDROID_SIGNING_KEY != ''
       id: sign-rustdesk
       with:
         releaseDirectory: ./signed-apk
@@ -772,13 +773,13 @@ jobs:
       env:
         BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
     - name: Upload Artifacts
-      if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+      if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
         path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
     - name: Save installer artifact (not published)
-      if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+      if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: visual-software-build-rustdesk-android-${{ matrix.job.arch }}-19
@@ -787,7 +788,7 @@ jobs:
         if-no-files-found: error
         retention-days: 14
     - name: Save installer artifact (not published)
-      if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
+      if: env.ANDROID_SIGNING_KEY == '' && env.UPLOAD_ARTIFACT == 'true'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: visual-software-build-rustdesk-android-${{ matrix.job.arch }}-20
@@ -931,7 +932,7 @@ jobs:
         echo Last build tool version is: $BUILD_TOOL_VERSION
     - uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407
       name: Sign app APK
-      if: env.ANDROID_SIGNING_KEY != null
+      if: env.ANDROID_SIGNING_KEY != ''
       id: sign-rustdesk
       with:
         releaseDirectory: ./signed-apk
@@ -942,13 +943,13 @@ jobs:
       env:
         BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
     - name: Upload Artifacts
-      if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+      if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: rustdesk-${{ env.VERSION }}-universal.apk
         path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
     - name: Save installer artifact (not published)
-      if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+      if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: visual-software-build-rustdesk-android-universal-16
@@ -957,7 +958,7 @@ jobs:
         if-no-files-found: error
         retention-days: 14
     - name: Save installer artifact (not published)
-      if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
+      if: env.ANDROID_SIGNING_KEY == '' && env.UPLOAD_ARTIFACT == 'true'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: visual-software-build-rustdesk-android-universal-17
