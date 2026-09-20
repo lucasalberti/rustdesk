@@ -55,6 +55,8 @@ const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_VP9
 
 // video const
 
+const val MAX_SCREEN_SIZE = 1200
+
 const val VIDEO_KEY_BIT_RATE = 1024_000
 const val VIDEO_KEY_FRAME_RATE = 30
 
@@ -62,9 +64,9 @@ class MainService : Service() {
 
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
-    fun rustPointerInput(kind: String, mask: Int, x: Int, y: Int) {
-        // turn on screen with LIFT_DOWN when screen off
-        if (!powerManager.isInteractive && (kind == "touch" || mask == LIFT_DOWN)) {
+    fun rustPointerInput(kind: Int, mask: Int, x: Int, y: Int) {
+        // turn on screen with LEFT_DOWN when screen off
+        if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             if (wakeLock.isHeld) {
                 Log.d(logTag, "Turn on Screen, WakeLock release")
                 wakeLock.release()
@@ -73,10 +75,10 @@ class MainService : Service() {
             wakeLock.acquire(5000)
         } else {
             when (kind) {
-                "touch" -> {
+                0 -> { // touch
                     InputService.ctx?.onTouchInput(mask, x, y)
                 }
-                "mouse" -> {
+                1 -> { // mouse
                     InputService.ctx?.onMouseInput(mask, x, y)
                 }
                 else -> {
@@ -101,6 +103,9 @@ class MainService : Service() {
                     put("scale",SCREEN_INFO.scale)
                 }.toString()
             }
+            "is_start" -> {
+                isStart.toString()
+            }
             else -> ""
         }
     }
@@ -117,9 +122,9 @@ class MainService : Service() {
                     val authorized = jsonObject["authorized"] as Boolean
                     val isFileTransfer = jsonObject["is_file_transfer"] as Boolean
                     val type = if (isFileTransfer) {
-                        translate("File Connection")
+                        translate("Transfer file")
                     } else {
-                        translate("Screen Connection")
+                        translate("Share screen")
                     }
                     if (authorized) {
                         if (!isFileTransfer && !isStart) {
@@ -170,6 +175,14 @@ class MainService : Service() {
                 Log.d(logTag, "from rust:stop_capture")
                 stopCapture()
             }
+            "half_scale" -> {
+                val halfScale = arg1.toBoolean()
+                if (isHalfScale != halfScale) {
+                    isHalfScale = halfScale
+                    updateScreenInfo(resources.configuration.orientation)
+                }
+                
+            }
             else -> {
             }
         }
@@ -180,11 +193,6 @@ class MainService : Service() {
 
     private val powerManager: PowerManager by lazy { applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val wakeLock: PowerManager.WakeLock by lazy { powerManager.newWakeLock(PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "rustdesk:wakelock")}
-
-    private fun translate(input: String): String {
-        Log.d(logTag, "translate:$LOCAL_NAME")
-        return FFI.translateLocale(LOCAL_NAME, input)
-    }
 
     companion object {
         private var _isReady = false // media permission ready status
@@ -242,9 +250,11 @@ class MainService : Service() {
 
     override fun onDestroy() {
         checkMediaPermission()
+        stopService(Intent(this, FloatingWindowService::class.java))
         super.onDestroy()
     }
 
+    private var isHalfScale: Boolean? = null;
     private fun updateScreenInfo(orientation: Int) {
         var w: Int
         var h: Int
@@ -277,6 +287,12 @@ class MainService : Service() {
         Log.d(logTag,"updateScreenInfo:w:$w,h:$h")
         var scale = 1
         if (w != 0 && h != 0) {
+            if (isHalfScale == true && (w > MAX_SCREEN_SIZE || h > MAX_SCREEN_SIZE)) {
+                scale = 2
+                w /= scale
+                h /= scale
+                dpi /= scale
+            }
             if (SCREEN_INFO.width != w) {
                 SCREEN_INFO.width = w
                 SCREEN_INFO.height = h
@@ -286,6 +302,8 @@ class MainService : Service() {
                     stopCapture()
                     FFI.refreshScreen()
                     startCapture()
+                } else {
+                    FFI.refreshScreen()
                 }
             }
 
@@ -415,6 +433,7 @@ class MainService : Service() {
         checkMediaPermission()
         _isStart = true
         FFI.setFrameRawEnable("video",true)
+        MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         return true
     }
 
@@ -423,6 +442,7 @@ class MainService : Service() {
         Log.d(logTag, "Stop Capture")
         FFI.setFrameRawEnable("video",false)
         _isStart = false
+        MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         // release video
         if (reuseVirtualDisplay) {
             // The virtual display video projection can be paused by calling `setSurface(null)`.
@@ -469,6 +489,7 @@ class MainService : Service() {
         mediaProjection = null
         checkMediaPermission()
         stopForeground(true)
+        stopService(Intent(this, FloatingWindowService::class.java))
         stopSelf()
     }
 

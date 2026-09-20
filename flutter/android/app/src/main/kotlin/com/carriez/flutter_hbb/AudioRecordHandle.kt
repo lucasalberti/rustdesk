@@ -62,7 +62,13 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                 return false
             }
         }
-        audioRecorder = builder.build()
+        val recorder = try {
+            builder.build()
+        } catch (e: Exception) {
+            Log.e(logTag, "createAudioRecorder failed", e)
+            return false
+        }
+        audioRecorder = recorder
         Log.d(logTag, "createAudioRecorder done,minBufferSize:$minBufferSize")
         return true
     }
@@ -116,24 +122,20 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     }
 
     fun onVoiceCallStarted(mediaProjection: MediaProjection?): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+        if (!isSupportVoiceCall()) {
             return false
         }
-        if (isVideoStart() || isAudioStart()) {
-            if (!switchToVoiceCall(mediaProjection)) {
-                return false
-            }
-        } else {
-            if (!switchToVoiceCall(mediaProjection)) {
-                return false
-            }
+        // No need to check if video or audio is started here.
+        if (!switchToVoiceCall(mediaProjection)) {
+            return false
         }
         return true
     }
 
     fun onVoiceCallClosed(mediaProjection: MediaProjection?): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            return false
+        // Return true if not supported, because is was not started.
+        if (!isSupportVoiceCall()) {
+            return true
         }
         if (isVideoStart()) {
             switchOutVoiceCall(mediaProjection)
@@ -180,9 +182,6 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     }
 
     fun tryReleaseAudio() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            return
-        }
         if (isAudioStart() || isVideoStart()) {
             return
         }

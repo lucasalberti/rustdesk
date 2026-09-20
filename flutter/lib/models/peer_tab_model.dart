@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
@@ -22,29 +23,26 @@ class PeerTabModel with ChangeNotifier {
   int get currentTab => _currentTab;
   int _currentTab = 0; // index in tabNames
   static const int maxTabCount = 5;
-  static const String kPeerTabIndex = 'peer-tab-index';
-  static const String kPeerTabOrder = 'peer-tab-order';
-  static const String kPeerTabVisible = 'peer-tab-visible';
   static const List<String> tabNames = [
     'Recent sessions',
     'Favorites',
     'Discovered',
     'Address book',
-    'Group',
+    'Accessible devices',
   ];
   static const List<IconData> icons = [
     Icons.access_time_filled,
     Icons.star,
     Icons.explore,
     IconFont.addressBook,
-    Icons.group,
+    IconFont.deviceGroupFill,
   ];
   List<bool> isEnabled = List.from([
     true,
     true,
-    !isWeb,
+    !isWeb && bind.mainGetLocalOption(key: "disable-discovery-panel") != "Y",
     !(bind.isDisableAb() || bind.isDisableAccount()),
-    !bind.isDisableAccount(),
+    !(bind.isDisableGroupPanel() || bind.isDisableAccount()),
   ]);
   final List<bool> _isVisible = List.filled(maxTabCount, true, growable: false);
   List<bool> get isVisibleEnabled => () {
@@ -72,7 +70,7 @@ class PeerTabModel with ChangeNotifier {
   PeerTabModel(this.parent) {
     // visible
     try {
-      final option = bind.getLocalFlutterOption(k: kPeerTabVisible);
+      final option = bind.getLocalFlutterOption(k: kOptionPeerTabVisible);
       if (option.isNotEmpty) {
         List<dynamic> decodeList = jsonDecode(option);
         if (decodeList.length == _isVisible.length) {
@@ -88,7 +86,7 @@ class PeerTabModel with ChangeNotifier {
     }
     // order
     try {
-      final option = bind.getLocalFlutterOption(k: kPeerTabOrder);
+      final option = bind.getLocalFlutterOption(k: kOptionPeerTabOrder);
       if (option.isNotEmpty) {
         List<dynamic> decodeList = jsonDecode(option);
         if (decodeList.length == maxTabCount) {
@@ -112,7 +110,7 @@ class PeerTabModel with ChangeNotifier {
     }
     // init currentTab
     _currentTab =
-        int.tryParse(bind.getLocalFlutterOption(k: kPeerTabIndex)) ?? 0;
+        int.tryParse(bind.getLocalFlutterOption(k: kOptionPeerTabIndex)) ?? 0;
     if (_currentTab < 0 || _currentTab >= maxTabCount) {
       _currentTab = 0;
     }
@@ -154,7 +152,7 @@ class PeerTabModel with ChangeNotifier {
       // https://github.com/flutter/flutter/issues/101275#issuecomment-1604541700
       // After onTap, the shift key should be pressed for a while when not in multiselection mode,
       // because onTap is delayed when onDoubleTap is not null
-      if (isDesktop && !_isShiftDown) return;
+      if (isDesktop || isWebDesktop) return;
       _multiSelectionMode = true;
     }
     final cached = _currentTabCachedPeers.map((e) => e.id).toList();
@@ -186,10 +184,17 @@ class PeerTabModel with ChangeNotifier {
     notifyListeners();
   }
 
+  // `notifyListeners()` will cause many rebuilds.
+  // So, we need to reduce the calls to "notifyListeners()" only when necessary.
+  // A better way is to use a new model.
   setCurrentTabCachedPeers(List<Peer> peers) {
     Future.delayed(Duration.zero, () {
+      final isPreEmpty = _currentTabCachedPeers.isEmpty;
       _currentTabCachedPeers = peers;
-      notifyListeners();
+      final isNowEmpty = _currentTabCachedPeers.isEmpty;
+      if (isPreEmpty != isNowEmpty) {
+        notifyListeners();
+      }
     });
   }
 
@@ -222,7 +227,7 @@ class PeerTabModel with ChangeNotifier {
         }
         try {
           bind.setLocalFlutterOption(
-              k: kPeerTabVisible, v: jsonEncode(_isVisible));
+              k: kOptionPeerTabVisible, v: jsonEncode(_isVisible));
         } catch (_) {}
         notifyListeners();
       }
@@ -258,7 +263,7 @@ class PeerTabModel with ChangeNotifier {
       for (int i = 0; i < list.length; i++) {
         orders[i] = list[i];
       }
-      bind.setLocalFlutterOption(k: kPeerTabOrder, v: jsonEncode(orders));
+      bind.setLocalFlutterOption(k: kOptionPeerTabOrder, v: jsonEncode(orders));
       notifyListeners();
     }
   }

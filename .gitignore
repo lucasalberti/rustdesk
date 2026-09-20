@@ -3,6 +3,7 @@
 .vscode
 .idea
 .DS_Store
+.env
 libsciter-gtk.so
 src/ui/inline.rs
 extractor
@@ -52,3 +53,11 @@ lib/generated_bridge.dart
 examples/**/target/
 # ===
 vcpkg_installed
+flutter/lib/generated_plugin_registrant.dart
+libsciter.dylib
+flutter/web/
+# Visual Software: assets are source; generated server settings stay local.
+!/flutter/assets/logo.png
+!/flutter/assets/icon.png
+!/branding/visual-software/originals/favicon.png
+/src/visual_software_server.rs

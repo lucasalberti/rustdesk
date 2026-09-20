@@ -48,20 +48,26 @@ class PlatformFFI {
 
   static get isMain => instance._appType == kAppTypeMain;
 
+  static String getByName(String name, [String arg = '']) {
+    return '';
+  }
+
+  static void setByName(String name, [String value = '']) {}
+
   static Future<String> getVersion() async {
     PackageInfo packageInfo = await PackageInfo.fromPlatform();
     return packageInfo.version;
   }
 
   bool registerEventHandler(
-      String eventName, String handlerName, HandleEvent handler) {
+      String eventName, String handlerName, HandleEvent handler, {bool replace = false}) {
     debugPrint('registerEventHandler $eventName $handlerName');
     var handlers = _eventHandlers[eventName];
     if (handlers == null) {
       _eventHandlers[eventName] = {handlerName: handler};
       return true;
     } else {
-      if (handlers.containsKey(handlerName)) {
+      if (!replace && handlers.containsKey(handlerName)) {
         return false;
       } else {
         handlers[handlerName] = handler;
@@ -117,9 +123,13 @@ class PlatformFFI {
             ? DynamicLibrary.open('librustdesk.so')
             : isWindows
                 ? DynamicLibrary.open('librustdesk.dll')
-                : isMacOS
-                    ? DynamicLibrary.open("liblibrustdesk.dylib")
-                    : DynamicLibrary.process();
+                :
+                // Use executable itself as the dynamic library for MacOS.
+                // Multiple dylib instances will cause some global instances to be invalid.
+                // eg. `lazy_static` objects in rust side, will be created more than once, which is not expected.
+                //
+                // isMacOS? DynamicLibrary.open("liblibrustdesk.dylib") :
+                DynamicLibrary.process();
     debugPrint('initializing FFI $_appType');
     try {
       _session_get_rgba = dylib.lookupFunction<F3Dart, F3>("session_get_rgba");
@@ -132,9 +142,10 @@ class PlatformFFI {
       _ffiBind = RustdeskImpl(dylib);
 
       if (isLinux) {
-        // Start a dbus service, no need to await
-        _ffiBind.mainStartDbusServer();
-        _ffiBind.mainStartPa();
+        if (isMain) {
+          // Start a dbus service for uri links, no need to await
+          _ffiBind.mainStartDbusServer();
+        }
       } else if (isMacOS && isMain) {
         // Start ipc service for uri links.
         _ffiBind.mainStartIpcUrlServer();
@@ -145,7 +156,10 @@ class PlatformFFI {
           // only support for android
           _homeDir = (await ExternalPath.getExternalStorageDirectories())[0];
         } else if (isIOS) {
-          _homeDir = _ffiBind.mainGetDataDirIos();
+          // The previous code was `_homeDir = (await getDownloadsDirectory())?.path ?? '';`,
+          // which provided the `downloads` path in the sandbox.
+          // It is unclear why we now use the `data` directory in the sandbox instead.
+          _homeDir = _ffiBind.mainGetDataDirIos(appDir: _dir);
         } else {
           // no need to set home dir
         }
@@ -271,4 +285,6 @@ class PlatformFFI {
   void syncAndroidServiceAppDirConfigPath() {
     invokeMethod(AndroidChannel.kSyncAppDirConfigPath, _dir);
   }
+
+  void setFullscreenCallback(void Function(bool) fun) {}
 }

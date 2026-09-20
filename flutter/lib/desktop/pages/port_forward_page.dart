@@ -25,7 +25,7 @@ class _PortForward {
 }
 
 class PortForwardPage extends StatefulWidget {
-  const PortForwardPage({
+  PortForwardPage({
     Key? key,
     required this.id,
     required this.password,
@@ -33,6 +33,7 @@ class PortForwardPage extends StatefulWidget {
     required this.isRDP,
     required this.isSharedPassword,
     this.forceRelay,
+    this.connToken,
   }) : super(key: key);
   final String id;
   final String? password;
@@ -40,9 +41,17 @@ class PortForwardPage extends StatefulWidget {
   final bool isRDP;
   final bool? forceRelay;
   final bool? isSharedPassword;
+  final String? connToken;
+  final SimpleWrapper<State<PortForwardPage>?> _lastState = SimpleWrapper(null);
+
+  FFI get ffi => (_lastState.value! as _PortForwardPageState)._ffi;
 
   @override
-  State<PortForwardPage> createState() => _PortForwardPageState();
+  State<PortForwardPage> createState() {
+    final state = _PortForwardPageState();
+    _lastState.value = state;
+    return state;
+  }
 }
 
 class _PortForwardPageState extends State<PortForwardPage>
@@ -62,10 +71,14 @@ class _PortForwardPageState extends State<PortForwardPage>
         password: widget.password,
         isSharedPassword: widget.isSharedPassword,
         forceRelay: widget.forceRelay,
+        connToken: widget.connToken,
         isRdp: widget.isRDP);
-    Get.put(_ffi, tag: 'pf_${widget.id}');
+    Get.put<FFI>(_ffi, tag: 'pf_${widget.id}');
     debugPrint("Port forward page init success with id ${widget.id}");
-    widget.tabController.onSelected?.call(widget.id);
+    // Call onSelected in post frame callback, since we cannot guarantee that the callback will not call setState.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.tabController.onSelected?.call(widget.id);
+    });
   }
 
   @override
@@ -141,8 +154,9 @@ class _PortForwardPageState extends State<PortForwardPage>
         child: Text(translate(label)).marginOnly(left: _kTextLeftMargin));
 
     return Theme(
-      data: Theme.of(context)
-          .copyWith(backgroundColor: Theme.of(context).colorScheme.background),
+      data: Theme.of(context).copyWith(
+        colorScheme: Theme.of(context).colorScheme,
+      ),
       child: Obx(() => ListView.builder(
           controller: ScrollController(),
           itemCount: pfs.length + 2,
@@ -231,7 +245,7 @@ class _PortForwardPageState extends State<PortForwardPage>
               inputFormatters: inputFormatters,
               decoration: InputDecoration(
                 hintText: hint,
-              ))),
+              )).workaroundFreezeLinuxMint()),
     );
   }
 
@@ -289,7 +303,7 @@ class _PortForwardPageState extends State<PortForwardPage>
         ).marginOnly(left: _kTextLeftMargin));
     return Theme(
       data: Theme.of(context)
-          .copyWith(backgroundColor: Theme.of(context).colorScheme.background),
+          .copyWith(colorScheme: Theme.of(context).colorScheme),
       child: ListView.builder(
           controller: ScrollController(),
           itemCount: 2,

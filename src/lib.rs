@@ -1,10 +1,10 @@
 mod keyboard;
-#[cfg(not(any(target_os = "ios")))]
 /// cbindgen:ignore
 pub mod platform;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use platform::{
-    get_cursor, get_cursor_data, get_cursor_pos, get_focused_display, start_os_service,
+    clip_cursor, get_cursor, get_cursor_data, get_cursor_pos, get_focused_display,
+    set_cursor_pos, start_os_service,
 };
 #[cfg(not(any(target_os = "ios")))]
 /// cbindgen:ignore
@@ -12,7 +12,6 @@ mod server;
 #[cfg(not(any(target_os = "ios")))]
 pub use self::server::*;
 mod client;
-#[cfg(not(any(target_os = "ios")))]
 mod lan;
 #[cfg(not(any(target_os = "ios")))]
 mod rendezvous_mediator;
@@ -25,7 +24,6 @@ pub mod ipc;
 #[cfg(not(any(
     target_os = "android",
     target_os = "ios",
-    feature = "cli",
     feature = "flutter"
 )))]
 pub mod ui;
@@ -39,11 +37,12 @@ pub mod flutter;
 pub mod flutter_ffi;
 use common::*;
 mod auth_2fa;
-#[cfg(feature = "cli")]
-pub mod cli;
-#[cfg(not(any(target_os = "android", target_os = "ios", feature = "cli")))]
+#[cfg(not(target_os = "ios"))]
+mod clipboard;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod core_main;
 mod custom_server;
+mod visual_software;
 mod lang;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod port_forward;
@@ -54,6 +53,12 @@ pub mod plugin;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tray;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod whiteboard;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod updater;
 
 mod ui_cm_interface;
 mod ui_interface;
@@ -68,3 +73,5 @@ pub mod privacy_mode;
 
 #[cfg(windows)]
 pub mod virtual_display_manager;
+
+mod kcp_stream;

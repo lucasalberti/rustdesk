@@ -9,16 +9,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn start_tray() {
+    if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    crate::server::check_zombie();
+
     allow_err!(make_tray());
 }
 
-pub fn make_tray() -> hbb_common::ResultType<()> {
+fn make_tray() -> hbb_common::ResultType<()> {
     // https://github.com/tauri-apps/tray-icon/blob/dev/examples/tao.rs
     use hbb_common::anyhow::Context;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::{
         menu::{Menu, MenuEvent, MenuItem},
-        TrayIconBuilder, TrayIconEvent as TrayEvent,
+        TrayIcon, TrayIconBuilder, TrayIconEvent as TrayEvent,
     };
     let icon;
     #[cfg(target_os = "macos")]
@@ -41,12 +51,25 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
     let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
         .context("Failed to open icon")?;
 
-    let event_loop = EventLoopBuilder::new().build();
+    let mut event_loop = EventLoopBuilder::new().build();
 
     let tray_menu = Menu::new();
-    let quit_i = MenuItem::new(translate("Exit".to_owned()), true, None);
+    let hide_stop_service = crate::ui_interface::get_builtin_option(
+        hbb_common::config::keys::OPTION_HIDE_STOP_SERVICE,
+    ) == "Y";
+    // The tray icon is only shown when the service is running, so we don't need to check
+    // the `stop-service` option here.
+    let quit_i = if !hide_stop_service {
+        Some(MenuItem::new(translate("Stop service".to_owned()), true, None))
+    } else {
+        None
+    };
     let open_i = MenuItem::new(translate("Open".to_owned()), true, None);
-    tray_menu.append_items(&[&open_i, &quit_i]).ok();
+    if let Some(quit_i) = &quit_i {
+        tray_menu.append_items(&[&open_i, quit_i]).ok();
+    } else {
+        tray_menu.append_items(&[&open_i]).ok();
+    }
     let tooltip = |count: usize| {
         if count == 0 {
             format!(
@@ -63,21 +86,12 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
             )
         }
     };
-    let _tray_icon = Some(
-        TrayIconBuilder::new()
-            .with_menu(Box::new(tray_menu))
-            .with_tooltip(tooltip(0))
-            .with_icon(icon)
-            .with_icon_as_template(true) // mac only
-            .build()?,
-    );
-    let _tray_icon = Arc::new(Mutex::new(_tray_icon));
+    let mut _tray_icon: Arc<Mutex<Option<TrayIcon>>> = Default::default();
 
     let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayEvent::receiver();
     #[cfg(windows)]
     let (ipc_sender, ipc_receiver) = std::sync::mpsc::channel::<Data>();
-    let mut docker_hiden = false;
 
     let open_func = move || {
         if cfg!(not(feature = "flutter")) {
@@ -95,12 +109,13 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
             crate::run_me::<&str>(vec![]).ok();
         }
         #[cfg(target_os = "linux")]
-        if !std::process::Command::new("xdg-open")
-            .arg(&crate::get_uri_prefix())
-            .spawn()
-            .is_ok()
         {
-            crate::run_me::<&str>(vec![]).ok();
+            // Do not use "xdg-open", it won't read the config.
+            if crate::dbus::invoke_new_connection(crate::get_uri_prefix()).is_err() {
+                if let Ok(task) = crate::run_me::<&str>(vec![]) {
+                    crate::server::CHILD_PROCESS.lock().unwrap().push(task);
+                }
+            }
         }
     };
 
@@ -110,26 +125,71 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
     });
     #[cfg(windows)]
     let mut last_click = std::time::Instant::now();
-    event_loop.run(move |_event, _, control_flow| {
-        if !docker_hiden {
-            #[cfg(target_os = "macos")]
-            crate::platform::macos::hide_dock();
-            docker_hiden = true;
-        }
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::EventLoopExtMacOS;
+        event_loop.set_activation_policy(tao::platform::macos::ActivationPolicy::Accessory);
+    }
+    event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(100),
         );
 
-        if let Ok(event) = menu_channel.try_recv() {
-            if event.id == quit_i.id() {
-                /* failed in windows, seems no permission to check system process
-                if !crate::check_process("--server", false) {
-                    *control_flow = ControlFlow::Exit;
-                    return;
+        if let tao::event::Event::NewEvents(tao::event::StartCause::Init) = event {
+            // for fixing https://github.com/rustdesk/rustdesk/discussions/10210#discussioncomment-14600745
+            // so we start tray, but not to show it
+            if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+                return;
+            }
+            // We create the icon once the event loop is actually running
+            // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
+            let mut builder = TrayIconBuilder::new()
+                .with_menu(Box::new(tray_menu.clone()))
+                .with_tooltip(tooltip(0))
+                .with_icon(icon.clone());
+            #[cfg(target_os = "macos")]
+            {
+                builder = builder.with_icon_as_template(true);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // Required since tray-icon 0.17
+                // Fixes #15215, #15222, #15410
+                builder = builder.with_menu_on_left_click(false);
+            }
+            let tray = builder.build();
+            match tray {
+                Ok(tray) => _tray_icon = Arc::new(Mutex::new(Some(tray))),
+                Err(err) => {
+                    log::error!("Failed to create tray icon: {}", err);
                 }
-                */
-                if !crate::platform::uninstall_service(false, false) {
-                    *control_flow = ControlFlow::Exit;
+            };
+
+            // We have to request a redraw here to have the icon actually show up.
+            // Tao only exposes a redraw method on the Window so we use core-foundation directly.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
+
+                let rl = CFRunLoopGetMain();
+                CFRunLoopWakeUp(rl);
+            }
+        }
+
+        if let Ok(event) = menu_channel.try_recv() {
+            if let Some(quit_i) = &quit_i {
+                if event.id == quit_i.id() {
+                    /* failed in windows, seems no permission to check system process
+                    if !crate::check_process("--server", false) {
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                    */
+                    if !crate::platform::uninstall_service(false, false) {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                } else if event.id == open_i.id() {
+                    open_func();
                 }
             } else if event.id == open_i.id() {
                 open_func();
@@ -138,14 +198,23 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
 
         if let Ok(_event) = tray_channel.try_recv() {
             #[cfg(target_os = "windows")]
-            if _event.click_type == tray_icon::ClickType::Left
-                || _event.click_type == tray_icon::ClickType::Double
-            {
-                if last_click.elapsed() < std::time::Duration::from_secs(1) {
-                    return;
+            match _event {
+                TrayEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } => {
+                    if button == tray_icon::MouseButton::Left
+                        && button_state == tray_icon::MouseButtonState::Up
+                    {
+                        if last_click.elapsed() < std::time::Duration::from_secs(1) {
+                            return;
+                        }
+                        open_func();
+                        last_click = std::time::Instant::now();
+                    }
                 }
-                open_func();
-                last_click = std::time::Instant::now();
+                _ => {}
             }
         }
 

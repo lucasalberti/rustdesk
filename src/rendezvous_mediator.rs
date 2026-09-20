@@ -2,9 +2,9 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
@@ -12,39 +12,91 @@ use uuid::Uuid;
 use hbb_common::{
     allow_err,
     anyhow::{self, bail},
-    config::{self, Config, CONNECT_TIMEOUT, READ_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT},
+    config::{
+        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT,
+    },
     futures::future::join_all,
     log,
     protobuf::Message as _,
-    proxy::Proxy,
     rendezvous_proto::*,
     sleep,
-    socket_client::{self, connect_tcp, is_ipv4},
-    tcp::FramedStream,
-    tokio::{
-        self, select,
-        sync::Mutex,
-        time::{interval, Duration},
-    },
+    socket_client::{self, connect_tcp, is_ipv4, new_direct_udp_for, new_udp_for},
+    tokio::{self, select, sync::Mutex, time::interval},
     udp::FramedSocket,
-    AddrMangle, IntoTargetAddr, ResultType, TargetAddr,
+    AddrMangle, IntoTargetAddr, ResultType, Stream, TargetAddr,
 };
 
 use crate::{
     check_port,
-    server::{check_zombie, new as new_server, ServerPtr},
+    server::{check_zombie, new as new_server, ConnectionMeta, ServerPtr},
 };
 
 type Message = RendezvousMessage;
 
-const TIMER_OUT: Duration = Duration::from_secs(1);
-const DEFAULT_KEEP_ALIVE: i32 = 60_000;
+fn connection_meta(
+    control_permissions: Option<ControlPermissions>,
+    controlled_context: Option<ControlledContext>,
+) -> ConnectionMeta {
+    ConnectionMeta {
+        control_permissions,
+        controlled_context,
+    }
+}
 
 lazy_static::lazy_static! {
-    static ref SOLVING_PK_MISMATCH: Arc<Mutex<String>> = Default::default();
+    static ref SOLVING_PK_MISMATCH: Mutex<String> = Default::default();
+    static ref LAST_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
+static SENT_REGISTER_PK: AtomicBool = AtomicBool::new(false);
+pub(crate) static NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "android")]
+static NOTIFIED_NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
+// register_pk retry interval (ms) when device is awaiting deployment
+const DEPLOY_RETRY_INTERVAL: i64 = 30_000;
+lazy_static::lazy_static! {
+    static ref LAST_NOT_DEPLOYED_REGISTER: Mutex<Option<Instant>> = Mutex::new(None);
+}
+
+// Single source of truth for the "awaiting deployment" backoff. The server has
+// already told us this device is not in its db; until the operator runs
+// `rustdesk --deploy --token <api_token>` there is no point re-running the
+// register path more often than DEPLOY_RETRY_INTERVAL. Gating in the timer
+// loops (rather than only inside register_pk) also avoids the
+// last_register_sent / fails / latency / UDP-rebind churn the loop would
+// otherwise spin on while no response ever comes back.
+async fn deploy_register_throttled() -> bool {
+    if !NEEDS_DEPLOY.load(Ordering::SeqCst) {
+        return false;
+    }
+    LAST_NOT_DEPLOYED_REGISTER
+        .lock()
+        .await
+        .map(|t| (t.elapsed().as_millis() as i64) < DEPLOY_RETRY_INTERVAL)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "android")]
+fn notify_android_needs_deploy() {
+    if NOTIFIED_NEEDS_DEPLOY.load(Ordering::SeqCst) {
+        return;
+    }
+    let event = serde_json::json!({ "name": "android_needs_deploy" }).to_string();
+    if matches!(
+        crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, event),
+        Some(true)
+    ) {
+        NOTIFIED_NEEDS_DEPLOY.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn reset_needs_deploy_notification() {
+    NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+    NOTIFIED_NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+}
 
 #[derive(Clone)]
 pub struct RendezvousMediator {
@@ -62,28 +114,31 @@ impl RendezvousMediator {
     }
 
     pub async fn start_all() {
+        crate::test_nat_type();
         if config::is_outgoing_only() {
             loop {
                 sleep(1.).await;
             }
         }
         crate::hbbs_http::sync::start();
-        let mut nat_tested = false;
+        #[cfg(target_os = "windows")]
+        if crate::platform::is_installed() && crate::is_server() {
+            crate::updater::start_auto_update();
+        }
         check_zombie();
         let server = new_server();
-        if Config::get_nat_type() == NatType::UNKNOWN_NAT as i32 {
-            crate::test_nat_type();
-            nat_tested = true;
-        }
-        if !Config::get_option("stop-service").is_empty() {
+        if config::option2bool("stop-service", &Config::get_option("stop-service")) {
             crate::test_rendezvous_server();
         }
         let server_cloned = server.clone();
         tokio::spawn(async move {
             direct_server(server_cloned).await;
         });
+        #[cfg(target_os = "android")]
+        let start_lan_listening = true;
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if crate::platform::is_installed() {
+        let start_lan_listening = crate::platform::is_installed();
+        if start_lan_listening {
             std::thread::spawn(move || {
                 allow_err!(super::lan::start_listening());
             });
@@ -93,25 +148,33 @@ impl RendezvousMediator {
         if crate::is_server() {
             crate::platform::linux_desktop_manager::start_xdesktop();
         }
+        scrap::codec::test_av1();
+        *LAST_NOT_DEPLOYED_REGISTER.lock().await = None;
         loop {
+            let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
-            if Config::get_option("stop-service").is_empty()
+            if !config::option2bool("stop-service", &Config::get_option("stop-service"))
                 && !crate::platform::installing_service()
             {
-                if !nat_tested {
-                    crate::test_nat_type();
-                    nat_tested = true;
-                }
                 let mut futs = Vec::new();
                 let servers = Config::get_rendezvous_servers();
                 SHOULD_EXIT.store(false, Ordering::SeqCst);
                 MANUAL_RESTARTED.store(false, Ordering::SeqCst);
                 for host in servers.clone() {
                     let server = server.clone();
+                    let timeout = timeout.clone();
                     futs.push(tokio::spawn(async move {
                         if let Err(err) = Self::start(server, host).await {
-                            log::error!("rendezvous mediator error: {err}");
+                            let err = format!("rendezvous mediator error: {err}");
+                            // When user reboot, there might be below error, waiting too long
+                            // (CONNECT_TIMEOUT 18s) will make user think there is bug
+                            if err.contains("10054") || err.contains("11001") {
+                                // No such host is known. (os error 11001)
+                                // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
+                                *timeout.write().unwrap() = 3000;
+                            }
+                            log::error!("{err}");
                         }
                         // SHOULD_EXIT here is to ensure once one exits, the others also exit.
                         SHOULD_EXIT.store(true, Ordering::SeqCst);
@@ -122,11 +185,15 @@ impl RendezvousMediator {
                 server.write().unwrap().close_connections();
             }
             Config::reset_online();
+            let timeout = *timeout.read().unwrap();
             if !MANUAL_RESTARTED.load(Ordering::SeqCst) {
                 let elapsed = conn_start_time.elapsed().as_millis() as u64;
-                if elapsed < CONNECT_TIMEOUT {
-                    sleep(((CONNECT_TIMEOUT - elapsed) / 1000) as _).await;
+                if elapsed < timeout {
+                    sleep(((timeout - elapsed) / 1000) as _).await;
                 }
+            } else {
+                // https://github.com/rustdesk/rustdesk/issues/12233
+                sleep(0.033).await;
             }
         }
     }
@@ -146,15 +213,16 @@ impl RendezvousMediator {
 
     pub async fn start_udp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
-        let (mut socket, mut addr) = socket_client::new_udp_for(&host, CONNECT_TIMEOUT).await?;
+        log::info!("start udp: {host}");
+        let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
         let mut rz = Self {
             addr: addr.clone(),
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
-            keep_alive: DEFAULT_KEEP_ALIVE,
+            keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
 
-        let mut timer = crate::rustdesk_interval(interval(TIMER_OUT));
+        let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         const MIN_REG_TIMEOUT: i64 = 3_000;
         const MAX_REG_TIMEOUT: i64 = 30_000;
         let mut reg_timeout = MIN_REG_TIMEOUT;
@@ -205,7 +273,7 @@ impl RendezvousMediator {
                                 log::debug!("Non-protobuf message bytes received: {:?}", bytes);
                             }
                         },
-                        Some(Err(e)) => bail!("Failed to receive next {}", e),  // maybe socks5 tcp disconnected
+                        Some(Err(e)) => bail!("Failed to receive next: {}", e),  // maybe socks5 tcp disconnected
                         None => {
                             bail!("Socket receive none. Maybe socks5 server is down.");
                         },
@@ -214,6 +282,14 @@ impl RendezvousMediator {
                 _ = timer.tick() => {
                     if SHOULD_EXIT.load(Ordering::SeqCst) {
                         break;
+                    }
+                    // The server already told us this device is not deployed. Skip
+                    // the whole register / fails / latency / UDP-rebind path until
+                    // DEPLOY_RETRY_INTERVAL elapses, otherwise the loop spins every
+                    // few seconds (log spam + misapplied network-recovery rebind)
+                    // until the operator runs `rustdesk --deploy`.
+                    if deploy_register_throttled().await {
+                        continue;
                     }
                     let now = Some(Instant::now());
                     let expired = last_register_resp.map(|x| x.elapsed().as_millis() as i64 >= REG_INTERVAL).unwrap_or(true);
@@ -278,9 +354,25 @@ impl RendezvousMediator {
                         Config::set_key_confirmed(true);
                         Config::set_host_key_confirmed(&self.host_prefix, true);
                         *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
+                        NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+                        #[cfg(target_os = "android")]
+                        reset_needs_deploy_notification();
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
+                    }
+                    Ok(register_pk_response::Result::NOT_DEPLOYED) => {
+                        if !NEEDS_DEPLOY.load(Ordering::SeqCst) {
+                            log::warn!("Server requires deployment. Run `rustdesk --deploy --token <api_token>` on this device.");
+                        }
+                        NEEDS_DEPLOY.store(true, Ordering::SeqCst);
+                        // Clear key_confirmed so the UI reflects the truth: this device is
+                        // not currently registered. Covers the case where an online device
+                        // was deleted by an admin while running.
+                        Config::set_key_confirmed(false);
+                        Config::set_host_key_confirmed(&self.host_prefix, false);
+                        #[cfg(target_os = "android")]
+                        notify_android_needs_deploy();
                     }
                     _ => {
                         log::error!("unknown RegisterPkResponse");
@@ -330,6 +422,7 @@ impl RendezvousMediator {
 
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
+        log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
         crate::secure_tcp(&mut conn, &key).await?;
@@ -337,13 +430,13 @@ impl RendezvousMediator {
             addr: conn.local_addr().into_target_addr()?,
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
-            keep_alive: DEFAULT_KEEP_ALIVE,
+            keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
-        let mut timer = crate::rustdesk_interval(interval(TIMER_OUT));
+        let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
         // we won't support connecting to multiple rendzvous servers any more, so we can use a global variable here.
-        Config::set_host_key_confirmed(&host, false);
+        Config::set_host_key_confirmed(&rz.host_prefix, false);
         loop {
             let mut update_latency = || {
                 let latency = last_register_sent
@@ -357,6 +450,8 @@ impl RendezvousMediator {
                     last_recv_msg = Instant::now();
                     let bytes = res.ok_or_else(|| anyhow::anyhow!("Rendezvous connection is reset by the peer"))??;
                     if bytes.is_empty() {
+                        // After fixing frequent register_pk, for websocket, nginx need to set proxy_read_timeout to more than 60 seconds, eg: 120s
+                        // https://serverfault.com/questions/1060525/why-is-my-websocket-connection-gets-closed-in-60-seconds
                         conn.send_bytes(bytes::Bytes::new()).await?;
                         continue; // heartbeat
                     }
@@ -372,7 +467,7 @@ impl RendezvousMediator {
                         bail!("Rendezvous connection is timeout");
                     }
                     if (!Config::get_key_confirmed() ||
-                        !Config::get_host_key_confirmed(&host)) &&
+                        !Config::get_host_key_confirmed(&rz.host_prefix)) &&
                         last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL) >= REG_INTERVAL {
                         rz.register_pk(Sink::Stream(&mut conn)).await?;
                         last_register_sent = Some(Instant::now());
@@ -386,13 +481,11 @@ impl RendezvousMediator {
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
         log::info!("start rendezvous mediator of {}", host);
         //If the investment agent type is http or https, then tcp forwarding is enabled.
-        let is_http_proxy = if let Some(conf) = Config::get_socks() {
-            let proxy = Proxy::from_conf(&conf, None)?;
-            proxy.is_http_or_https()
-        } else {
-            false
-        };
-        if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some()) || is_http_proxy {
+        if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
+            || Config::is_proxy()
+            || use_ws()
+            || crate::is_udp_disabled()
+        {
             Self::start_tcp(server, host).await
         } else {
             Self::start_udp(server, host).await
@@ -400,6 +493,18 @@ impl RendezvousMediator {
     }
 
     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
+        let addr = AddrMangle::decode(&rr.socket_addr);
+        let last = *LAST_RELAY_MSG.lock().await;
+        *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
+        // skip duplicate relay request messages
+        if last.0 == addr && last.1.elapsed().as_millis() < 100 {
+            return Ok(());
+        }
+        let meta = connection_meta(
+            rr.control_permissions.into_option(),
+            rr.controlled_context.into_option(),
+        );
+
         self.create_relay(
             rr.socket_addr.into(),
             rr.relay_server,
@@ -407,6 +512,8 @@ impl RendezvousMediator {
             server,
             rr.secure,
             false,
+            Default::default(),
+            meta,
         )
         .await
     }
@@ -419,6 +526,8 @@ impl RendezvousMediator {
         server: ServerPtr,
         secure: bool,
         initiate: bool,
+        socket_addr_v6: bytes::Bytes,
+        meta: ConnectionMeta,
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&socket_addr);
         log::info!(
@@ -435,6 +544,7 @@ impl RendezvousMediator {
         let mut rr = RelayResponse {
             socket_addr: socket_addr.into(),
             version: crate::VERSION.to_owned(),
+            socket_addr_v6,
             ..Default::default()
         };
         if initiate {
@@ -451,17 +561,40 @@ impl RendezvousMediator {
             peer_addr,
             secure,
             is_ipv4(&self.addr),
+            meta,
         )
         .await;
         Ok(())
     }
 
     async fn handle_intranet(&self, fla: FetchLocalAddr, server: ServerPtr) -> ResultType<()> {
+        let addr = AddrMangle::decode(&fla.socket_addr);
+        let last = *LAST_MSG.lock().await;
+        *LAST_MSG.lock().await = (addr, Instant::now());
+        // skip duplicate punch hole messages
+        if last.0 == addr && last.1.elapsed().as_millis() < 100 {
+            return Ok(());
+        }
+        let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
         let relay_server = self.get_relay_server(fla.relay_server.clone());
-        // nat64, go relay directly, because current hbbs will crash if demangle ipv6 address
-        if is_ipv4(&self.addr) && !config::is_disable_tcp_listen() && !Config::is_proxy() {
+        let relay = use_ws() || Config::is_proxy();
+        let mut socket_addr_v6 = Default::default();
+        let meta = connection_meta(
+            fla.control_permissions.clone().into_option(),
+            fla.controlled_context.clone().into_option(),
+        );
+        if peer_addr_v6.port() > 0 && !relay {
+            socket_addr_v6 = start_ipv6(peer_addr_v6, addr, server.clone(), meta.clone()).await;
+        }
+        if is_ipv4(&self.addr) && !relay && !config::is_disable_tcp_listen() {
             if let Err(err) = self
-                .handle_intranet_(fla.clone(), server.clone(), relay_server.clone())
+                .handle_intranet_(
+                    fla.clone(),
+                    server.clone(),
+                    relay_server.clone(),
+                    socket_addr_v6.clone(),
+                    meta.clone(),
+                )
                 .await
             {
                 log::debug!("Failed to handle intranet: {:?}, will try relay", err);
@@ -477,6 +610,8 @@ impl RendezvousMediator {
             server,
             true,
             true,
+            socket_addr_v6,
+            meta,
         )
         .await
     }
@@ -486,6 +621,8 @@ impl RendezvousMediator {
         fla: FetchLocalAddr,
         server: ServerPtr,
         relay_server: String,
+        socket_addr_v6: bytes::Bytes,
+        meta: ConnectionMeta,
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&fla.socket_addr);
         log::debug!("Handle intranet from {:?}", peer_addr);
@@ -501,19 +638,40 @@ impl RendezvousMediator {
             local_addr: AddrMangle::encode(local_addr).into(),
             relay_server,
             version: crate::VERSION.to_owned(),
+            socket_addr_v6,
             ..Default::default()
         });
         let bytes = msg_out.write_to_bytes()?;
         socket.send_raw(bytes).await?;
-        crate::accept_connection(server.clone(), socket, peer_addr, true).await;
+        crate::accept_connection(server.clone(), socket, peer_addr, true, meta).await;
         Ok(())
     }
 
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
+        let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
+        let last = *LAST_MSG.lock().await;
+        *LAST_MSG.lock().await = (peer_addr, Instant::now());
+        // skip duplicate punch hole messages
+        if last.0 == peer_addr && last.1.elapsed().as_millis() < 100 {
+            return Ok(());
+        }
+        let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
+        let relay = use_ws() || Config::is_proxy() || ph.force_relay;
+        let mut socket_addr_v6 = Default::default();
+        let meta = connection_meta(
+            ph.control_permissions.into_option(),
+            ph.controlled_context.into_option(),
+        );
+        if peer_addr_v6.port() > 0 && !relay {
+            socket_addr_v6 =
+                start_ipv6(peer_addr_v6, peer_addr, server.clone(), meta.clone()).await;
+        }
         let relay_server = self.get_relay_server(ph.relay_server);
+        // for ensure, websocket go relay directly
         if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
             || Config::get_nat_type() == NatType::SYMMETRIC as i32
-            || config::is_disable_tcp_listen()
+            || relay
+            || (config::is_disable_tcp_listen() && ph.udp_port <= 0)
         {
             let uuid = Uuid::new_v4().to_string();
             return self
@@ -524,11 +682,29 @@ impl RendezvousMediator {
                     server,
                     true,
                     true,
+                    socket_addr_v6.clone(),
+                    meta,
                 )
                 .await;
         }
-        let peer_addr = AddrMangle::decode(&ph.socket_addr);
-        log::debug!("Punch hole to {:?}", peer_addr);
+        use hbb_common::protobuf::Enum;
+        let nat_type = NatType::from_i32(Config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
+        let msg_punch = PunchHoleSent {
+            socket_addr: ph.socket_addr,
+            id: Config::get_id(),
+            relay_server,
+            nat_type: nat_type.into(),
+            version: crate::VERSION.to_owned(),
+            socket_addr_v6,
+            ..Default::default()
+        };
+        if ph.udp_port > 0 {
+            peer_addr.set_port(ph.udp_port as u16);
+            self.punch_udp_hole(peer_addr, server, msg_punch, meta)
+                .await?;
+            return Ok(());
+        }
+        log::debug!("Punch tcp hole to {:?}", peer_addr);
         let mut socket = {
             let socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
             let local_addr = socket.local_addr();
@@ -538,23 +714,53 @@ impl RendezvousMediator {
             socket
         };
         let mut msg_out = Message::new();
-        use hbb_common::protobuf::Enum;
-        let nat_type = NatType::from_i32(Config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
-        msg_out.set_punch_hole_sent(PunchHoleSent {
-            socket_addr: ph.socket_addr,
-            id: Config::get_id(),
-            relay_server,
-            nat_type: nat_type.into(),
-            version: crate::VERSION.to_owned(),
-            ..Default::default()
-        });
+        msg_out.set_punch_hole_sent(msg_punch);
         let bytes = msg_out.write_to_bytes()?;
         socket.send_raw(bytes).await?;
-        crate::accept_connection(server.clone(), socket, peer_addr, true).await;
+        crate::accept_connection(server.clone(), socket, peer_addr, true, meta).await;
+        Ok(())
+    }
+
+    async fn punch_udp_hole(
+        &self,
+        peer_addr: SocketAddr,
+        server: ServerPtr,
+        msg_punch: PunchHoleSent,
+        meta: ConnectionMeta,
+    ) -> ResultType<()> {
+        let mut msg_out = Message::new();
+        msg_out.set_punch_hole_sent(msg_punch);
+        let (socket, addr) = new_direct_udp_for(&self.host).await?;
+        let data = msg_out.write_to_bytes()?;
+        socket.send_to(&data, addr).await?;
+        let socket_cloned = socket.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let tm = (hbb_common::time_based_rand() % 20 + 10) as f32 / 1000.;
+                hbb_common::sleep(tm).await;
+                socket.send_to(&data, addr).await.ok();
+            }
+        });
+        udp_nat_listen(socket_cloned.clone(), peer_addr, peer_addr, server, meta).await?;
         Ok(())
     }
 
     async fn register_pk(&mut self, socket: Sink<'_>) -> ResultType<()> {
+        // Throttle register_pk when the device is awaiting deployment: server
+        // already told us we're not in its db; sending more often than every
+        // DEPLOY_RETRY_INTERVAL ms is wasted traffic until the operator runs
+        // `rustdesk --deploy --token <api_token>`.
+        if NEEDS_DEPLOY.load(Ordering::SeqCst) {
+            let mut last = LAST_NOT_DEPLOYED_REGISTER.lock().await;
+            if let Some(t) = *last {
+                if (t.elapsed().as_millis() as i64) < DEPLOY_RETRY_INTERVAL {
+                    return Ok(());
+                }
+            }
+            *last = Some(Instant::now());
+        } else {
+            *LAST_NOT_DEPLOYED_REGISTER.lock().await = None;
+        }
         let mut msg_out = Message::new();
         let pk = Config::get_key_pair().1;
         let uuid = hbb_common::get_uuid();
@@ -563,9 +769,11 @@ impl RendezvousMediator {
             id,
             uuid: uuid.into(),
             pk: pk.into(),
+            no_register_device: Config::no_register_device(),
             ..Default::default()
         });
         socket.send(&msg_out).await?;
+        SENT_REGISTER_PK.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -640,8 +848,10 @@ async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
     loop {
-        let disabled = Config::get_option("direct-server").is_empty()
-            || !Config::get_option("stop-service").is_empty();
+        let disabled = !option2bool(
+            OPTION_DIRECT_SERVER,
+            &Config::get_option(OPTION_DIRECT_SERVER),
+        ) || option2bool("stop-service", &Config::get_option("stop-service"));
         if !disabled && listener.is_none() {
             port = get_direct_port();
             match hbb_common::tcp::listen_any(port as _).await {
@@ -688,6 +898,7 @@ async fn direct_server(server: ServerPtr) {
                             hbb_common::Stream::from(stream, local_addr),
                             addr,
                             false,
+                            ConnectionMeta::default(), // Direct connections don't have server-side user context.
                         )
                         .await
                     );
@@ -701,126 +912,9 @@ async fn direct_server(server: ServerPtr) {
     }
 }
 
-pub async fn query_online_states<F: FnOnce(Vec<String>, Vec<String>)>(ids: Vec<String>, f: F) {
-    let test = false;
-    if test {
-        sleep(1.5).await;
-        let mut onlines = ids;
-        let offlines = onlines.drain((onlines.len() / 2)..).collect();
-        f(onlines, offlines)
-    } else {
-        let query_begin = Instant::now();
-        let query_timeout = std::time::Duration::from_millis(3_000);
-        loop {
-            if SHOULD_EXIT.load(Ordering::SeqCst) {
-                break;
-            }
-            match query_online_states_(&ids, query_timeout).await {
-                Ok((onlines, offlines)) => {
-                    f(onlines, offlines);
-                    break;
-                }
-                Err(e) => {
-                    log::debug!("{}", &e);
-                }
-            }
-
-            if query_begin.elapsed() > query_timeout {
-                log::debug!(
-                    "query onlines timeout {:?} ({:?})",
-                    query_begin.elapsed(),
-                    query_timeout
-                );
-                break;
-            }
-
-            sleep(1.5).await;
-        }
-    }
-}
-
-async fn create_online_stream() -> ResultType<FramedStream> {
-    let (rendezvous_server, _servers, _contained) =
-        crate::get_rendezvous_server(READ_TIMEOUT).await;
-    let tmp: Vec<&str> = rendezvous_server.split(":").collect();
-    if tmp.len() != 2 {
-        bail!("Invalid server address: {}", rendezvous_server);
-    }
-    let port: u16 = tmp[1].parse()?;
-    if port == 0 {
-        bail!("Invalid server address: {}", rendezvous_server);
-    }
-    let online_server = format!("{}:{}", tmp[0], port - 1);
-    connect_tcp(online_server, CONNECT_TIMEOUT).await
-}
-
-async fn query_online_states_(
-    ids: &Vec<String>,
-    timeout: std::time::Duration,
-) -> ResultType<(Vec<String>, Vec<String>)> {
-    let query_begin = Instant::now();
-
-    let mut msg_out = RendezvousMessage::new();
-    msg_out.set_online_request(OnlineRequest {
-        id: Config::get_id(),
-        peers: ids.clone(),
-        ..Default::default()
-    });
-
-    loop {
-        if SHOULD_EXIT.load(Ordering::SeqCst) {
-            // No need to care about onlines
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let mut socket = match create_online_stream().await {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("Failed to create peers online stream, {e}");
-                return Ok((vec![], ids.clone()));
-            }
-        };
-        if let Err(e) = socket.send(&msg_out).await {
-            log::debug!("Failed to send peers online states query, {e}");
-            return Ok((vec![], ids.clone()));
-        }
-        if let Some(msg_in) = crate::common::get_next_nonkeyexchange_msg(&mut socket, None).await {
-            match msg_in.union {
-                Some(rendezvous_message::Union::OnlineResponse(online_response)) => {
-                    let states = online_response.states;
-                    let mut onlines = Vec::new();
-                    let mut offlines = Vec::new();
-                    for i in 0..ids.len() {
-                        // bytes index from left to right
-                        let bit_value = 0x01 << (7 - i % 8);
-                        if (states[i / 8] & bit_value) == bit_value {
-                            onlines.push(ids[i].clone());
-                        } else {
-                            offlines.push(ids[i].clone());
-                        }
-                    }
-                    return Ok((onlines, offlines));
-                }
-                _ => {
-                    // ignore
-                }
-            }
-        } else {
-            // TODO: Make sure socket closed?
-            bail!("Online stream receives None");
-        }
-
-        if query_begin.elapsed() > timeout {
-            bail!("Try query onlines timeout {:?}", &timeout);
-        }
-
-        sleep(300.0).await;
-    }
-}
-
 enum Sink<'a> {
     Framed(&'a mut FramedSocket, &'a TargetAddr<'a>),
-    Stream(&'a mut FramedStream),
+    Stream(&'a mut Stream),
 }
 
 impl Sink<'_> {
@@ -832,23 +926,77 @@ impl Sink<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use hbb_common::tokio;
+async fn start_ipv6(
+    peer_addr_v6: SocketAddr,
+    peer_addr_v4: SocketAddr,
+    server: ServerPtr,
+    meta: ConnectionMeta,
+) -> bytes::Bytes {
+    crate::test_ipv6().await;
+    if let Some((socket, local_addr_v6)) = crate::get_ipv6_socket().await {
+        let server = server.clone();
+        tokio::spawn(async move {
+            allow_err!(
+                udp_nat_listen(socket.clone(), peer_addr_v6, peer_addr_v4, server, meta).await
+            );
+        });
+        return local_addr_v6;
+    }
+    Default::default()
+}
 
-    #[tokio::test]
-    async fn test_query_onlines() {
-        super::query_online_states(
-            vec![
-                "152183996".to_owned(),
-                "165782066".to_owned(),
-                "155323351".to_owned(),
-                "460952777".to_owned(),
-            ],
-            |onlines: Vec<String>, offlines: Vec<String>| {
-                println!("onlines: {:?}, offlines: {:?}", &onlines, &offlines);
-            },
+async fn udp_nat_listen(
+    socket: Arc<tokio::net::UdpSocket>,
+    peer_addr: SocketAddr,
+    peer_addr_v4: SocketAddr,
+    server: ServerPtr,
+    meta: ConnectionMeta,
+) -> ResultType<()> {
+    let tm = Instant::now();
+    let socket_cloned = socket.clone();
+    let func = async {
+        socket.connect(peer_addr).await?;
+        let res = crate::punch_udp(socket.clone(), true).await?;
+        let stream = crate::kcp_stream::KcpStream::accept(
+            socket,
+            Duration::from_millis(CONNECT_TIMEOUT as _),
+            res,
         )
-        .await;
+        .await?;
+        crate::server::create_tcp_connection(server, stream.1, peer_addr_v4, true, meta).await?;
+        Ok(())
+    };
+    func.await.map_err(|e: anyhow::Error| {
+        anyhow::anyhow!(
+            "Stop listening on {:?} for remote {peer_addr} with KCP, {:?} elapsed: {e}",
+            socket_cloned.local_addr(),
+            tm.elapsed()
+        )
+    })?;
+    Ok(())
+}
+
+// When config is not yet synced from root, register_pk may have already been sent with a new generated pk.
+// After config sync completes, the pk may change. This struct detects pk changes and triggers
+// a re-registration by setting key_confirmed to false.
+// NOTE:
+// This only corrects PK registration for the current ID. If root uses a non-default mac-generated ID,
+// this does not resolve the multi-ID issue by itself.
+pub struct CheckIfResendPk {
+    pk: Option<Vec<u8>>,
+}
+impl CheckIfResendPk {
+    pub fn new() -> Self {
+        Self {
+            pk: Config::get_cached_pk(),
+        }
+    }
+}
+impl Drop for CheckIfResendPk {
+    fn drop(&mut self) {
+        if SENT_REGISTER_PK.load(Ordering::SeqCst) && Config::get_cached_pk() != self.pk {
+            Config::set_key_confirmed(false);
+            log::info!("Set key_confirmed to false due to pk changed, will resend register_pk");
+        }
     }
 }

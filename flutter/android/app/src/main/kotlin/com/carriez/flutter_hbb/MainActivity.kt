@@ -13,6 +13,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.ClipboardManager
+import android.os.Bundle
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -36,6 +38,9 @@ import kotlin.concurrent.thread
 class MainActivity : FlutterActivity() {
     companion object {
         var flutterMethodChannel: MethodChannel? = null
+        private var _rdClipboardManager: RdClipboardManager? = null
+        val rdClipboardManager: RdClipboardManager?
+            get() = _rdClipboardManager;
     }
 
     private val channelTag = "mChannel"
@@ -57,7 +62,13 @@ class MainActivity : FlutterActivity() {
             channelTag
         )
         initFlutterChannel(flutterMethodChannel!!)
-        thread { setCodecInfo() }
+        thread {
+            try {
+                setCodecInfo()
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to setCodecInfo: ${e.message}", e)
+            }
+        }
     }
 
     override fun onResume() {
@@ -82,6 +93,14 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_INVOKE_PERMISSION_ACTIVITY_MEDIA_PROJECTION && resultCode == RES_FAILED) {
             flutterMethodChannel?.invokeMethod("on_media_projection_canceled", null)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (_rdClipboardManager == null) {
+            _rdClipboardManager = RdClipboardManager(getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+            FFI.setClipboardManager(_rdClipboardManager!!)
         }
     }
 
@@ -181,12 +200,13 @@ class MainActivity : FlutterActivity() {
                 "stop_input" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                         InputService.ctx?.disableSelf()
+                    } else {
+                        InputService.ctx = null
+                        Companion.flutterMethodChannel?.invokeMethod(
+                            "on_state_changed",
+                            mapOf("name" to "input", "value" to InputService.isOpen.toString())
+                        )
                     }
-                    InputService.ctx = null
-                    Companion.flutterMethodChannel?.invokeMethod(
-                        "on_state_changed",
-                        mapOf("name" to "input", "value" to InputService.isOpen.toString())
-                    )
                     result.success(true)
                 }
                 "cancel_notification" -> {
@@ -206,6 +226,10 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(true)
 
+                }
+                "try_sync_clipboard" -> {
+                    rdClipboardManager?.syncClipboard(true)
+                    result.success(true)
                 }
                 GET_START_ON_BOOT_OPT -> {
                     val prefs = getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
@@ -233,6 +257,17 @@ class MainActivity : FlutterActivity() {
                         result.success(false)
                     }
                 }
+                GET_VALUE -> {
+                    if (call.arguments is String) {
+                        if (call.arguments == KEY_IS_SUPPORT_VOICE_CALL) {
+                            result.success(isSupportVoiceCall())
+                        } else {
+                            result.error("-1", "No such key", null)
+                        }
+                    } else {
+                        result.success(null)
+                    }
+                }
                 "on_voice_call_started" -> {
                     onVoiceCallStarted()
                 }
@@ -252,19 +287,12 @@ class MainActivity : FlutterActivity() {
         val codecArray = JSONArray()
 
         val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        var w = 0
-        var h = 0
-        @Suppress("DEPRECATION")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val m = windowManager.maximumWindowMetrics
-            w = m.bounds.width()
-            h = m.bounds.height()
-        } else {
-            val dm = DisplayMetrics()
-            windowManager.defaultDisplay.getRealMetrics(dm)
-            w = dm.widthPixels
-            h = dm.heightPixels
-        }
+        val wh = getScreenSize(windowManager)
+        var w = wh.first
+        var h = wh.second
+        val align = 64
+        w = (w + align - 1) / align * align
+        h = (h + align - 1) / align * align
         codecs.forEach { codec ->
             val codecObject = JSONObject()
             codecObject.put("name", codec.name)
@@ -281,21 +309,23 @@ class MainActivity : FlutterActivity() {
                     hw = true
                 }
             }
+            if (hw != true) {
+                return@forEach
+            }
             codecObject.put("hw", hw)
             var mime_type = ""
             codec.supportedTypes.forEach { type ->
-                if (listOf("video/avc", "video/hevc", "video/x-vnd.on2.vp8", "video/x-vnd.on2.vp9", "video/av01").contains(type)) {
+                if (listOf("video/avc", "video/hevc").contains(type)) { // "video/x-vnd.on2.vp8", "video/x-vnd.on2.vp9", "video/av01"
                     mime_type = type;
                 }
             }
             if (mime_type.isNotEmpty()) {
                 codecObject.put("mime_type", mime_type)
                 val caps = codec.getCapabilitiesForType(mime_type)
-                var usable = true;
                 if (codec.isEncoder) {
-                    // Encoder‘s max_height and max_width are interchangeable
+                    // Encoder's max_height and max_width are interchangeable
                     if (!caps.videoCapabilities.isSizeSupported(w,h) && !caps.videoCapabilities.isSizeSupported(h,w)) {
-                        usable = false
+                        return@forEach
                     }
                 }
                 codecObject.put("min_width", caps.videoCapabilities.supportedWidths.lower)
@@ -307,7 +337,7 @@ class MainActivity : FlutterActivity() {
                 val nv12 = caps.colorFormats.contains(COLOR_FormatYUV420SemiPlanar)
                 codecObject.put("nv12", nv12)
                 if (!(nv12 || surface)) {
-                    usable = false
+                    return@forEach
                 }
                 codecObject.put("min_bitrate", caps.videoCapabilities.bitrateRange.lower / 1000)
                 codecObject.put("max_bitrate", caps.videoCapabilities.bitrateRange.upper / 1000)
@@ -316,9 +346,10 @@ class MainActivity : FlutterActivity() {
                         codecObject.put("low_latency", caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency))
                     }
                 }
-                if (usable) {
-                    codecArray.put(codecObject)
+                if (!codec.isEncoder) {
+                    return@forEach
                 }
+                codecArray.put(codecObject)
             }
         }
         val result = JSONObject()
@@ -367,5 +398,18 @@ class MainActivity : FlutterActivity() {
         } else {
             Log.d(logTag, "onVoiceCallClosed success")
         }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
+        if (!disableFloatingWindow && MainService.isReady) {
+            startService(Intent(this, FloatingWindowService::class.java))
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        stopService(Intent(this, FloatingWindowService::class.java))
     }
 }
