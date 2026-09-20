@@ -3814,8 +3814,23 @@ class _LogoState extends State<_Logo> {
             },
           );
           return Container(
-            constraints: BoxConstraints(maxWidth: 300, maxHeight: 60),
-            child: image,
+            constraints: BoxConstraints(maxWidth: 300, maxHeight: 88),
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(height: 48, child: image),
+                const SizedBox(height: 4),
+                const Text(
+                  'RustDesk by Visual Software',
+                  style: TextStyle(color: Color(0xFF2C5065), fontSize: 11),
+                ),
+              ],
+            ),
           ).marginOnly(left: 12, right: 12, top: 12);
         }
         return const Offstage();
@@ -3824,7 +3839,7 @@ class _LogoState extends State<_Logo> {
   }
 }
 
-// max 300 x 60
+// Visual Software logo and attribution, with a white backing in both themes.
 Widget loadLogo() => const _Logo();
 
 Widget loadIcon(double size) {

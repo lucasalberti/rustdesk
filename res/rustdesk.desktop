@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=RustDesk
+Name=RustDesk by Visual Software
 GenericName=Remote Desktop
 Comment=Remote Desktop
 Exec=rustdesk %u
